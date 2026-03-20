@@ -81,6 +81,47 @@ TRADE_COLS = [
     "pnl_usd","pnl_pct","score","signals","notas",
 ]
 
+# ── Trades de demostración ───────────────────────────────
+def _make_demo_trades():
+    """Datos falsos para probar la app sin tocar Sheets."""
+    hoy = (datetime.now(timezone.utc)-timedelta(hours=6)).strftime("%Y-%m-%d")
+    ayer = (datetime.now(timezone.utc)-timedelta(hours=6)-timedelta(days=1)).strftime("%Y-%m-%d")
+    ant  = (datetime.now(timezone.utc)-timedelta(hours=6)-timedelta(days=2)).strftime("%Y-%m-%d")
+    return pd.DataFrame([
+        {"id":"d1","fecha":hoy,  "hora":"08:15","ticker":"NVDA","direction":"long",
+         "entry":177.50,"sl":175.80,"tp1":181.90,"shares":8,
+         "exit_price":181.90,"exit_hora":"09:42","resultado":"win",
+         "pnl_usd":27.20,"pnl_pct":1.53,"score":3,"signals":"VWAP+EMA","notas":"demo"},
+        {"id":"d2","fecha":hoy,  "hora":"09:05","ticker":"AMD","direction":"long",
+         "entry":122.30,"sl":120.90,"tp1":125.10,"shares":10,
+         "exit_price":120.90,"exit_hora":"09:55","resultado":"loss",
+         "pnl_usd":-14.00,"pnl_pct":-1.14,"score":2,"signals":"EMA","notas":"demo"},
+        {"id":"d3","fecha":hoy,  "hora":"09:50","ticker":"TSLA","direction":"short",
+         "entry":245.60,"sl":247.80,"tp1":241.20,"shares":6,
+         "exit_price":241.20,"exit_hora":"11:10","resultado":"win",
+         "pnl_usd":26.40,"pnl_pct":1.79,"score":2,"signals":"VWAP+BRK","notas":"demo"},
+        {"id":"d4","fecha":hoy,  "hora":"12:20","ticker":"AAPL","direction":"long",
+         "entry":213.40,"sl":211.90,"tp1":216.40,"shares":9,
+         "exit_price":None,"exit_hora":None,"resultado":None,
+         "pnl_usd":None,"pnl_pct":None,"score":2,"signals":"VWAP","notas":"demo — abierta"},
+        {"id":"d5","fecha":ayer, "hora":"08:30","ticker":"MSFT","direction":"long",
+         "entry":415.20,"sl":412.50,"tp1":420.60,"shares":3,
+         "exit_price":420.60,"exit_hora":"10:15","resultado":"win",
+         "pnl_usd":16.20,"pnl_pct":1.30,"score":3,"signals":"VWAP+EMA+BRK","notas":"demo"},
+        {"id":"d6","fecha":ayer, "hora":"11:45","ticker":"META","direction":"short",
+         "entry":582.10,"sl":585.40,"tp1":575.50,"shares":2,
+         "exit_price":575.50,"exit_hora":"13:20","resultado":"win",
+         "pnl_usd":13.20,"pnl_pct":1.13,"score":2,"signals":"EMA+BRK","notas":"demo"},
+        {"id":"d7","fecha":ant,  "hora":"09:10","ticker":"NVDA","direction":"short",
+         "entry":168.90,"sl":171.20,"tp1":164.50,"shares":8,
+         "exit_price":171.20,"exit_hora":"09:50","resultado":"loss",
+         "pnl_usd":-18.40,"pnl_pct":-1.36,"score":1,"signals":"VWAP","notas":"demo"},
+        {"id":"d8","fecha":ant,  "hora":"12:05","ticker":"AMD","direction":"long",
+         "entry":119.80,"sl":118.20,"tp1":123.00,"shares":11,
+         "exit_price":123.00,"exit_hora":"13:30","resultado":"win",
+         "pnl_usd":35.20,"pnl_pct":2.67,"score":3,"signals":"VWAP+EMA+BRK","notas":"demo"},
+    ])
+
 # ═══════════════════════════════════════════════════════════
 #  GOOGLE SHEETS — conexión
 #  Usa gspread 5.x (API estable, sin cambios breaking)
@@ -139,6 +180,13 @@ def numify(df: pd.DataFrame, cols: list) -> pd.DataFrame:
     return df
 
 def load_trades() -> pd.DataFrame:
+    # Modo demo — devuelve datos falsos sin tocar Sheets
+    if st.session_state.get("demo_mode", False):
+        df = _make_demo_trades()
+        for c in TRADE_COLS:
+            if c not in df.columns: df[c] = None
+        return df[TRADE_COLS].copy()
+
     ws, mode = get_sheet()
 
     if mode == "sheets" and ws is not None:
@@ -188,6 +236,9 @@ def _save_csv(df: pd.DataFrame):
     df.to_csv(FALLBACK_CSV, index=False)
 
 def save_trades(df: pd.DataFrame):
+    # Modo demo — no guarda nada
+    if st.session_state.get("demo_mode", False):
+        return
     _, mode = get_sheet()
     if mode == "sheets":
         if not _save_to_sheets(df):
@@ -257,11 +308,25 @@ def compute_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     d = raw.copy()
     for span, name in [(9,"e9"),(21,"e21"),(50,"e50")]:
         d[name] = d["Close"].ewm(span=span, adjust=False).mean()
-    hlc3      = (d["High"] + d["Low"] + d["Close"]) / 3
-    d["vwap"] = (
-        (hlc3 * d["Volume"]).groupby(hlc3.index.date).cumsum() /
-        d["Volume"].groupby(d["Volume"].index.date).cumsum()
-    )
+    hlc3 = (d["High"] + d["Low"] + d["Close"]) / 3
+
+    # Bug fix: yfinance devuelve índice tz-aware (US/Eastern).
+    # .date en un índice tz-aware de pandas retorna la fecha LOCAL correcta,
+    # pero en algunas versiones falla o agrupa mal. Normalizamos explícitamente.
+    try:
+        if hasattr(d.index, "tz") and d.index.tz is not None:
+            date_key = d.index.tz_convert("America/New_York").date
+        else:
+            date_key = d.index.date
+        date_ser = pd.Series(date_key, index=d.index)
+        d["vwap"] = (
+            (hlc3 * d["Volume"]).groupby(date_ser).cumsum() /
+            d["Volume"].groupby(date_ser).cumsum()
+        )
+    except Exception:
+        # Fallback: VWAP rolling 20 barras si falla el groupby por fecha
+        vol_sum = d["Volume"].rolling(20, min_periods=1).sum()
+        d["vwap"] = (hlc3 * d["Volume"]).rolling(20, min_periods=1).sum() / vol_sum.replace(0, np.nan)
     dx = d["Close"].diff()
     g  = dx.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     l  = (-dx.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
@@ -393,16 +458,42 @@ def get_prob(df, direction, trades_df, ticker, rr) -> float:
 # ═══════════════════════════════════════════════════════════
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_ticker(ticker, interval, _cache_key):
+    """
+    Descarga datos de yfinance con manejo robusto de errores.
+    Devuelve (df_con_indicadores, error_msg) — error_msg es "" si todo OK.
+    """
     try:
-        raw = yf.download(ticker, period="5d", interval=interval,
-                          auto_adjust=True, progress=False, timeout=8)
+        # Bug fix: "10d" en lugar de "5d" para garantizar ≥30 barras
+        # incluso en semanas con festivos o cuando el mercado cerró antes
+        raw = yf.download(
+            ticker, period="10d", interval=interval,
+            auto_adjust=True, progress=False,
+            timeout=20,          # Bug fix: 8s era demasiado corto en Streamlit Cloud
+            prepost=False,       # excluir pre/post market (volumen 0 rompe VWAP)
+        )
+
+        # Bug fix: yfinance ≥0.2.50 siempre devuelve MultiIndex aunque sea 1 ticker
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
-        if raw.empty or len(raw) < 60:
-            return None
-        return compute_indicators(raw)
-    except Exception:
-        return None
+        raw = raw.loc[:, ~raw.columns.duplicated()]   # eliminar columnas duplicadas
+
+        # Validar columnas requeridas
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        missing = [c for c in required if c not in raw.columns]
+        if missing:
+            return None, f"Columnas faltantes: {missing}"
+
+        # Filtrar barras con volumen 0 (pre/post market y días sin datos)
+        raw = raw[raw["Volume"] > 0].dropna(subset=["Close", "High", "Low"]).copy()
+
+        # Bug fix: umbral reducido a 30 (antes 60); con "10d" siempre hay suficientes
+        if raw.empty or len(raw) < 30:
+            return None, f"Datos insuficientes: {len(raw)} barras"
+
+        return compute_indicators(raw), ""
+
+    except Exception as e:
+        return None, str(e)
 
 def analyze_ticker(df, ticker, capital, risk_pct, rr):
     if df is None:
@@ -460,19 +551,40 @@ def analyze_ticker(df, ticker, capital, risk_pct, rr):
 def run_scan(tickers, interval, capital, risk_pct, rr, trades_df):
     cache_key = int(time.time() // 600)
     results   = []
+    diag      = []   # diagnóstico por ticker para debug
     prog      = st.progress(0, text="Iniciando...")
     for i, tk in enumerate(tickers):
         prog.progress((i+1)/len(tickers), text=f"Analizando {tk}... ({i+1}/{len(tickers)})")
-        df = fetch_ticker(tk, interval, cache_key)
-        r  = analyze_ticker(df, tk, capital, risk_pct, rr)
-        if r is None:
+        df_result = fetch_ticker(tk, interval, cache_key)
+        # fetch_ticker ahora devuelve (df, error_msg)
+        if isinstance(df_result, tuple):
+            df, err = df_result
+        else:
+            # compatibilidad si el caché aún tiene el formato antiguo
+            df, err = df_result, ""
+        if df is None:
+            diag.append({"tk": tk, "ok": False, "msg": err or "Sin datos suficientes"})
             continue
+        r = analyze_ticker(df, tk, capital, risk_pct, rr)
+        if r is None:
+            last = df.iloc[-1]
+            scl  = int(last.get("scl", 0)) if not pd.isna(last.get("scl", 0)) else 0
+            scs  = int(last.get("scs", 0)) if not pd.isna(last.get("scs", 0)) else 0
+            vr   = round(last["Volume"]/last["vavg"], 1) if last.get("vavg",0)>0 else 0
+            diag.append({
+                "tk": tk, "ok": False,
+                "msg": f"Sin señal · scl={scl} scs={scs} vol={vr}x rsi={round(float(last.get('rsi',0)),0)}",
+            })
+            continue
+        diag.append({"tk": tk, "ok": True, "msg": f"✅ score={r['score']} {r['direction'].upper()}"})
         try:
             r["prob"] = get_prob(df, r["direction"], trades_df, tk, rr)
         except Exception:
             r["prob"] = 50.0
         results.append(r)
     prog.empty()
+    # Guardar diagnóstico en session_state para mostrarlo en la UI
+    st.session_state["scan_diag"] = diag
     return sorted(results, key=lambda x: (x["score"], x["prob"]), reverse=True)
 
 # ═══════════════════════════════════════════════════════════
@@ -515,12 +627,19 @@ def calc_stats(cl: pd.DataFrame) -> dict:
 with st.sidebar:
     st.markdown("## ⚡ MarginEdge")
 
-    # Badge modo almacenamiento
-    _, mode = get_sheet()
-    if mode == "sheets":
-        st.success("☁ Google Sheets activo")
+    # ── Modo demo ──────────────────────────────────────
+    demo_mode = st.toggle("🧪 Modo demo", value=st.session_state.get("demo_mode", False),
+                          help="Usa datos de prueba — no lee ni escribe en Google Sheets")
+    st.session_state["demo_mode"] = demo_mode
+    if demo_mode:
+        st.warning("🧪 DEMO ACTIVO · Sheets no se toca", icon="🧪")
     else:
-        st.info("💾 Modo CSV local")
+        # Badge modo almacenamiento real
+        _, mode = get_sheet()
+        if mode == "sheets":
+            st.success("☁ Google Sheets activo")
+        else:
+            st.info("💾 Modo CSV local")
 
     if MKT_LIVE:
         st.success(f"🟢 ABIERTO · {OPEN_STR}–{CLOSE_STR}")
@@ -633,6 +752,26 @@ with tab_sen:
 
     if not signals:
         st.info("Sin señales con esos filtros. Baja el score mínimo o presiona '🔄 Actualizar señales'.")
+
+    # ── Panel de diagnóstico ─────────────────────────────────
+    diag = st.session_state.get("scan_diag", [])
+    if diag:
+        ok_n  = sum(1 for d in diag if d["ok"])
+        err_n = len(diag) - ok_n
+        lbl   = f"🔍 Diagnóstico del scanner — {ok_n} señal(es) · {err_n} sin señal"
+        with st.expander(lbl, expanded=(ok_n == 0 and err_n > 0)):
+            for d in diag:
+                icon  = "🟢" if d["ok"] else "🔴"
+                color = "#00e5a0" if d["ok"] else "#4a6070"
+                st.markdown(
+                    f"<span style='font-size:11px;font-family:monospace'>"
+                    f"{icon} <b style='color:#dde4f0'>{d['tk']:<6}</b> "
+                    f"<span style='color:{color}'>{d['msg']}</span></span>",
+                    unsafe_allow_html=True,
+                )
+
+    if not signals:
+        pass
     else:
         cols = st.columns(min(len(signals), 4))
         for i, s in enumerate(signals):
