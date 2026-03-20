@@ -350,8 +350,10 @@ def compute_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     s1s = xu(d["Close"], d["vwap"]) & v1 & bj & rs
     tl  = (d["Low"]  <= d["e21"] * 1.003) & (d["Close"] > d["e21"])
     ts  = (d["High"] >= d["e21"] * 0.997) & (d["Close"] < d["e21"])
-    s2l = tl & ~tl.shift(fill_value=False) & al & rl
-    s2s = ts & ~ts.shift(fill_value=False) & bj & rs
+    # s2l/s2s: toque de EMA21 funciona en mercado lateral —
+    # solo requiere que precio esté del lado correcto de EMA21, no tendencia fuerte vs EMA50
+    s2l = tl & ~tl.shift(fill_value=False) & (d["Close"] > d["e21"]) & rl
+    s2s = ts & ~ts.shift(fill_value=False) & (d["Close"] < d["e21"]) & rs
     ph  = d["High"].shift().rolling(20).max()
     pl  = d["Low"].shift().rolling(20).min()
     s3l = xo(d["Close"], ph) & v2 & (d["Close"] > d["e21"]) & rl
@@ -499,7 +501,9 @@ def analyze_ticker(df, ticker, capital, risk_pct, rr):
     if df is None:
         return None
     am = rr / 4.0
-    for offset in range(5):
+    # Fix: 15 barras (3.75 h en 15m) en lugar de 5 (75 min)
+    # Esto garantiza que señales de la primera ventana del día sigan visibles
+    for offset in range(15):
         idx = -(1 + offset)
         try:
             row = df.iloc[idx]
@@ -515,7 +519,10 @@ def analyze_ticker(df, ticker, capital, risk_pct, rr):
         dirn  = "long" if scl >= scs else "short"
         vavg  = row["vavg"] if row["vavg"] > 0 else 1
         vr    = row["Volume"] / vavg
-        if vr < (1.0 * (0.55 if offset == 0 else 1.0)):
+        # Fix: umbral consistente 0.5x para todos los offsets.
+        # Antes era 1.0x para offset>0, lo que descartaba señales de EMA (s2l)
+        # que no requieren volumen alto pero sí se generaban hace 2-3 barras.
+        if vr < 0.5:
             continue
         if dirn == "long"  and row["rsi"] > 73: continue
         if dirn == "short" and row["rsi"] < 27: continue
@@ -567,13 +574,23 @@ def run_scan(tickers, interval, capital, risk_pct, rr, trades_df):
             continue
         r = analyze_ticker(df, tk, capital, risk_pct, rr)
         if r is None:
-            last = df.iloc[-1]
-            scl  = int(last.get("scl", 0)) if not pd.isna(last.get("scl", 0)) else 0
-            scs  = int(last.get("scs", 0)) if not pd.isna(last.get("scs", 0)) else 0
-            vr   = round(last["Volume"]/last["vavg"], 1) if last.get("vavg",0)>0 else 0
+            # Diagnóstico detallado: muestra las últimas 15 barras revisadas
+            bar_details = []
+            for off in range(min(15, len(df))):
+                try:
+                    b = df.iloc[-(1+off)]
+                    bscl = int(b["scl"]) if not pd.isna(b.get("scl",0)) else 0
+                    bscs = int(b["scs"]) if not pd.isna(b.get("scs",0)) else 0
+                    bvr  = round(b["Volume"]/b["vavg"],1) if b.get("vavg",0)>0 else 0
+                    brs  = round(float(b.get("rsi",0)),0)
+                    if max(bscl,bscs) > 0:
+                        bar_details.append(f"offset-{off}: scl={bscl} scs={bscs} vol={bvr}x rsi={brs} ← señal pero filtrada")
+                except Exception:
+                    pass
+            detail_msg = " | ".join(bar_details) if bar_details else "scl=0 scs=0 en las 15 barras revisadas"
             diag.append({
                 "tk": tk, "ok": False,
-                "msg": f"Sin señal · scl={scl} scs={scs} vol={vr}x rsi={round(float(last.get('rsi',0)),0)}",
+                "msg": detail_msg,
             })
             continue
         diag.append({"tk": tk, "ok": True, "msg": f"✅ score={r['score']} {r['direction'].upper()}"})
