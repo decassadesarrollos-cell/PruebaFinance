@@ -713,8 +713,8 @@ stop_color   = "#ff3d55" if stop_pct_uso>75 else "#ffb020" if stop_pct_uso>40 el
 # ═══════════════════════════════════════════════════════════
 #  TABS
 # ═══════════════════════════════════════════════════════════
-tab_sen, tab_hoy, tab_his, tab_calc = st.tabs([
-    "⚡ Señales","📅 Hoy","📈 Historial","🔢 Calculadora",
+tab_sen, tab_hoy, tab_his, tab_bt, tab_calc = st.tabs([
+    "⚡ Señales","📅 Hoy","📈 Historial","🔬 Backtest","🔢 Calculadora",
 ])
 
 # ─── TAB 1 — SEÑALES ────────────────────────────────────
@@ -1037,7 +1037,262 @@ with tab_his:
         st.download_button("⬇ Exportar CSV", data=buf.getvalue(),
             file_name=f"marginedge_{hoy}.csv", mime="text/csv")
 
-# ─── TAB 4 — CALCULADORA ────────────────────────────────
+# ─── TAB 4 — BACKTEST ───────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  BACKTEST INTERNO
+#  Descarga histórico, detecta señales sin look-ahead,
+#  simula resultado (TP/SL) en las siguientes 8 barras,
+#  y guarda a Sheets con notas="backtest".
+# ═══════════════════════════════════════════════════════════
+def run_backtest(tickers, interval, capital, risk_pct, rr, min_score_bt, max_bars_fwd=8):
+    """
+    Retorna lista de dicts con trades simulados.
+    Reglas:
+    - Descarga 60d de datos históricos
+    - Recorre barra a barra (sin usar datos futuros para la señal)
+    - Cooldown de max_bars_fwd barras por ticker+dirección para evitar duplicados
+    - Simula si TP o SL se toca en las siguientes max_bars_fwd barras
+    - Descarta señales que expiran sin resultado (precio va lateral)
+    """
+    all_trades = []
+    prog = st.progress(0, text="Iniciando backtest...")
+
+    for ti, tk in enumerate(tickers):
+        prog.progress((ti + 1) / len(tickers), text=f"Backtesting {tk}... ({ti+1}/{len(tickers)})")
+        try:
+            raw = yf.download(tk, period="60d", interval=interval,
+                              auto_adjust=True, progress=False, timeout=20, prepost=False)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            raw = raw.loc[:, ~raw.columns.duplicated()]
+            raw = raw[raw["Volume"] > 0].dropna(subset=["Close","High","Low"]).copy()
+            if len(raw) < 60:
+                continue
+            df = compute_indicators(raw)
+        except Exception:
+            continue
+
+        cooldown_l = 0  # barras restantes de cooldown para long
+        cooldown_s = 0  # barras restantes de cooldown para short
+
+        for i in range(50, len(df) - max_bars_fwd):
+            row = df.iloc[i]
+            if pd.isna(row.get("rsi")) or pd.isna(row.get("atr")) or pd.isna(row.get("vavg")):
+                continue
+
+            scl = int(row["scl"])
+            scs = int(row["scs"])
+            atr_val = float(row["atr"])
+            vavg    = float(row["vavg"]) if row["vavg"] > 0 else 1
+            vr      = float(row["Volume"]) / vavg
+
+            # Determinar dirección con score mínimo
+            for dirn, sc, cd_attr in [("long", scl, "l"), ("short", scs, "s")]:
+                cd = cooldown_l if dirn == "long" else cooldown_s
+                if cd > 0:
+                    if dirn == "long":  cooldown_l -= 1
+                    else:               cooldown_s -= 1
+                    continue
+                if sc < min_score_bt:
+                    continue
+                if vr < 0.5:
+                    continue
+                if dirn == "long"  and float(row["rsi"]) > 73:
+                    continue
+                if dirn == "short" and float(row["rsi"]) < 27:
+                    continue
+
+                # Entrada al open de la siguiente barra (sin look-ahead)
+                entry = float(df["Open"].iloc[i + 1])
+                if entry <= 0 or pd.isna(entry):
+                    continue
+
+                sl_dist = atr_val * 1.5
+                sl  = entry - sl_dist if dirn == "long" else entry + sl_dist
+                tp1 = entry + sl_dist * rr if dirn == "long" else entry - sl_dist * rr
+
+                risk_usd = capital * risk_pct / 100
+                shares   = max(1, int(risk_usd / sl_dist)) if sl_dist > 0 else 1
+
+                # Simular resultado en las siguientes max_bars_fwd barras
+                resultado = None
+                exit_price = None
+                for j in range(i + 1, min(i + 1 + max_bars_fwd, len(df))):
+                    b = df.iloc[j]
+                    if dirn == "long":
+                        if float(b["Low"])  <= sl:  resultado = "loss"; exit_price = sl;  break
+                        if float(b["High"]) >= tp1: resultado = "win";  exit_price = tp1; break
+                    else:
+                        if float(b["High"]) >= sl:  resultado = "loss"; exit_price = sl;  break
+                        if float(b["Low"])  <= tp1: resultado = "win";  exit_price = tp1; break
+
+                # Descartar señales que expiran sin tocar TP ni SL
+                if resultado is None:
+                    continue
+
+                # Calcular P&L
+                diff    = (exit_price - entry) if dirn == "long" else (entry - exit_price)
+                pnl_usd = round(diff * shares, 2)
+                pnl_pct = round(diff / entry * 100, 3)
+
+                # Fecha y hora de la barra señal
+                bar_ts  = df.index[i]
+                try:
+                    if hasattr(bar_ts, "tz") and bar_ts.tz is not None:
+                        bar_local = bar_ts.tz_convert("America/Mexico_City")
+                    else:
+                        bar_local = bar_ts
+                    fecha_str = bar_local.strftime("%Y-%m-%d")
+                    hora_str  = bar_local.strftime("%H:%M")
+                except Exception:
+                    fecha_str = str(bar_ts)[:10]
+                    hora_str  = str(bar_ts)[11:16]
+
+                # Texto de señales activas
+                active = []
+                pv = float(df["Close"].iloc[i-1]) if i > 0 else entry
+                if dirn == "long":
+                    if float(row["Close"]) > float(row["vwap"]) and pv <= float(row["vwap"]): active.append("VWAP")
+                    if float(row["Low"]) <= float(row["e21"]) * 1.003:                        active.append("EMA")
+                else:
+                    if float(row["Close"]) < float(row["vwap"]) and pv >= float(row["vwap"]): active.append("VWAP")
+                    if float(row["High"]) >= float(row["e21"]) * 0.997:                        active.append("EMA")
+                signals_txt = "+".join(active) if active else f"s{sc}"
+
+                trade = {
+                    "id"        : f"bt_{tk}_{i}_{dirn[:1]}",
+                    "fecha"     : fecha_str,
+                    "hora"      : hora_str,
+                    "ticker"    : tk.upper(),
+                    "direction" : dirn,
+                    "entry"     : round(entry, 2),
+                    "sl"        : round(sl, 2),
+                    "tp1"       : round(tp1, 2),
+                    "shares"    : shares,
+                    "exit_price": round(exit_price, 2),
+                    "exit_hora" : "",
+                    "resultado" : resultado,
+                    "pnl_usd"   : pnl_usd,
+                    "pnl_pct"   : pnl_pct,
+                    "score"     : sc,
+                    "signals"   : signals_txt,
+                    "notas"     : "backtest",
+                }
+                all_trades.append(trade)
+
+                # Activar cooldown para evitar señales encadenadas del mismo setup
+                if dirn == "long":  cooldown_l = max_bars_fwd
+                else:               cooldown_s = max_bars_fwd
+
+    prog.empty()
+    return all_trades
+
+
+with tab_bt:
+    st.markdown("### 🔬 Backtest histórico automático")
+    st.caption("Corre el scanner sobre 60 días de datos históricos, simula resultados y alimenta el modelo ML.")
+
+    bt_col1, bt_col2 = st.columns(2)
+    with bt_col1:
+        bt_min_score = st.selectbox("Score mínimo para backtest", [1, 2, 3], index=1,
+                                     format_func=lambda x: f"{x}/3", key="bt_sc")
+        bt_max_bars  = st.slider("Ventana de simulación (barras)", 4, 16, 8, 1, key="bt_mb",
+                                  help="Cuántas barras hacia adelante se busca TP o SL")
+    with bt_col2:
+        bt_tickers = st.multiselect("Tickers a incluir", options=tickers,
+                                     default=tickers, key="bt_tks")
+
+    # Resumen de backtest existente en Sheets
+    bt_existing = trades_all[trades_all["notas"] == "backtest"] if not trades_all.empty else pd.DataFrame()
+    if not bt_existing.empty:
+        bt_n   = len(bt_existing)
+        bt_num = numify(bt_existing.copy(), ["pnl_usd"])
+        bt_wr  = (bt_existing["resultado"] == "win").mean() * 100
+        bt_pnl = bt_num["pnl_usd"].sum()
+        bm1, bm2, bm3 = st.columns(3)
+        bm1.metric("Trades backtest guardados", bt_n)
+        bm2.metric("Win rate histórico", f"{bt_wr:.1f}%")
+        bm3.metric("P&L simulado total", f"${bt_pnl:+.2f}")
+        st.divider()
+
+    # Botón ejecutar
+    if st.button("▶ Ejecutar backtest", type="primary", key="bt_run"):
+        if not bt_tickers:
+            st.error("Selecciona al menos un ticker.")
+        else:
+            with st.spinner("Descargando 60d de datos y simulando señales..."):
+                bt_results = run_backtest(
+                    bt_tickers, interval, capital, risk_pct,
+                    rr_ratio, bt_min_score, bt_max_bars
+                )
+            st.session_state["bt_results"] = bt_results
+
+    # Mostrar preview y botón de guardar
+    bt_results = st.session_state.get("bt_results", [])
+    if bt_results:
+        bt_df = pd.DataFrame(bt_results)
+        bt_df_num = numify(bt_df.copy(), ["pnl_usd"])
+        wins  = (bt_df["resultado"] == "win").sum()
+        total = len(bt_df)
+        wr_bt = wins / total * 100 if total else 0
+        pnl_bt = bt_df_num["pnl_usd"].sum()
+        wins_sum = bt_df_num[bt_df_num["pnl_usd"] > 0]["pnl_usd"].sum()
+        loss_sum = abs(bt_df_num[bt_df_num["pnl_usd"] < 0]["pnl_usd"].sum())
+        pf_bt = round(wins_sum / loss_sum, 2) if loss_sum > 0 else 0
+
+        st.markdown("**Resultados del backtest**")
+        rm1, rm2, rm3, rm4 = st.columns(4)
+        rm1.metric("Señales encontradas", total)
+        rm2.metric("Win rate",            f"{wr_bt:.1f}%")
+        rm3.metric("P&L simulado",        f"${pnl_bt:+.2f}")
+        rm4.metric("Profit factor",       pf_bt)
+
+        # Distribución por ticker
+        by_tk = bt_df_num.groupby("ticker").agg(
+            n=("resultado","count"),
+            wr=("resultado", lambda x: (x=="win").mean()*100),
+            pnl=("pnl_usd","sum")
+        ).round(1).reset_index().sort_values("pnl", ascending=False)
+
+        st.dataframe(
+            by_tk.rename(columns={"ticker":"Ticker","n":"Ops","wr":"WR %","pnl":"P&L $"}),
+            use_container_width=True, hide_index=True
+        )
+
+        # Preview de los primeros 20 trades
+        with st.expander("Ver trades simulados (primeros 20)"):
+            preview_cols = ["fecha","hora","ticker","direction","entry","sl","tp1",
+                            "exit_price","pnl_usd","score","signals","resultado"]
+            st.dataframe(bt_df[preview_cols].head(20), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # Advertencia antes de guardar
+        st.warning(
+            f"Se guardarán **{total} trades** con `notas='backtest'` en Google Sheets. "
+            "El modelo ML los usará con peso 1× (vs 3× para trades reales). "
+            "No se sobreescribirán trades reales.",
+            icon="⚠️"
+        )
+
+        if st.button("💾 Guardar en Sheets", type="primary", key="bt_save"):
+            existing_ids = set(trades_all["id"].astype(str).tolist()) if not trades_all.empty else set()
+            new_trades   = [t for t in bt_results if t["id"] not in existing_ids]
+            if not new_trades:
+                st.info("Todos estos trades ya están guardados.")
+            else:
+                new_df = pd.DataFrame(new_trades)
+                for c in TRADE_COLS:
+                    if c not in new_df.columns:
+                        new_df[c] = ""
+                combined = pd.concat([trades_all, new_df[TRADE_COLS]], ignore_index=True)
+                with st.spinner(f"Guardando {len(new_trades)} trades en Sheets..."):
+                    save_trades(combined)
+                st.success(f"✅ {len(new_trades)} trades de backtest guardados. El modelo ML mejorará en el próximo scan.")
+                st.session_state.pop("bt_results", None)
+                st.rerun()
+
+# ─── TAB 5 — CALCULADORA ────────────────────────────────
 with tab_calc:
     st.markdown("### Calculadora de posición")
     ca, cb = st.columns(2)
